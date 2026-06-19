@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 180"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 120"
     envVars:
       - key: OPENAI_API_KEY
         sync: false
