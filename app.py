@@ -62,7 +62,7 @@ def fetch_recent_news():
                     "source": source_name,
                     "title": entry.get("title", "(Không có tiêu đề)"),
                     "link": entry.get("link", ""),
-                    "summary": entry.get("summary", "")[:500],
+                    "summary": entry.get("summary", "")[:250],
                     "published": pub_dt,
                 })
         except Exception as e:
@@ -79,8 +79,8 @@ def summarize_with_ai(news_items):
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
     items_text = "\n\n".join(
-        f"[{item['source']}] {item['title']}\nLink: {item['link']}\nTóm tắt gốc: {item['summary']}"
-        for item in news_items[:60]
+        f"[{item['source']}] {item['title']}\nLink: {item['link']}\nTóm tắt gốc: {item['summary'][:200]}"
+        for item in news_items[:35]
     )
 
     system_prompt = """Bạn là trợ lý biên tập tin tài chính cho một chuyên viên đầu tư tại SCIC (Tổng Công ty Đầu tư và Kinh doanh vốn Nhà nước).
