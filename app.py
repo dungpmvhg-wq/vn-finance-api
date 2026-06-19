@@ -1,143 +1,134 @@
 """
-VN Finance Digest API
-Một API nhỏ chạy trên Render.com, được trang web (frontend) gọi vào
-mỗi khi người dùng bấm nút "Lấy tin mới nhất".
-
-Endpoint chính: GET /api/digest
-Trả về JSON: { "html": "<...bản tóm tắt HTML...>", "generated_at": "...", "total_news": 135 }
+VN Finance Digest API - phiên bản async
+Dùng FastAPI + httpx async để tránh bị gunicorn/uvicorn timeout khi gọi OpenAI.
 """
 
 import os
-import time
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 
 import feedparser
-from flask import Flask, jsonify
-from flask_cors import CORS
-from openai import OpenAI
+import httpx
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-app = Flask(__name__)
-# Cho phép trang web (chạy ở domain khác) gọi vào API này
-CORS(app)
+# Cache đơn giản trong bộ nhớ - 15 phút
+_cache = {"data": None, "timestamp": 0.0}
+CACHE_TTL = 15 * 60
 
 RSS_FEEDS = [
     ("CafeF - Chứng khoán", "https://cafef.vn/thi-truong-chung-khoan.rss"),
     ("CafeF - Tài chính ngân hàng", "https://cafef.vn/tai-chinh-ngan-hang.rss"),
     ("CafeF - Doanh nghiệp", "https://cafef.vn/doanh-nghiep.rss"),
-    ("CafeF - Vĩ mô đầu tư", "https://cafef.vn/vi-mo-dau-tu.rss"),
     ("VnExpress - Kinh doanh", "https://vnexpress.net/rss/kinh-doanh.rss"),
-    ("Vietstock - Chứng khoán", "https://vietstock.vn/830/chung-khoan.rss"),
+    ("Vietstock", "https://vietstock.vn/830/chung-khoan.rss"),
 ]
 
-HOURS_LOOKBACK = 24
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-# Cache đơn giản trong bộ nhớ: tránh gọi OpenAI liên tục nếu nhiều người bấm
-# nút gần nhau. Cache tồn tại trong CACHE_TTL_SECONDS.
-_cache = {"data": None, "timestamp": 0}
-CACHE_TTL_SECONDS = 15 * 60  # 15 phút
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"}
 
 
-def fetch_recent_news():
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_LOOKBACK)
-    all_items = []
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
 
-    for source_name, url in RSS_FEEDS:
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+
+def fetch_news():
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    items = []
+    for source, url in RSS_FEEDS:
         try:
-            parsed = feedparser.parse(url, request_headers=HEADERS)
-            for entry in parsed.entries:
-                published = entry.get("published_parsed") or entry.get("updated_parsed")
-                if published is None:
+            d = feedparser.parse(url, request_headers=HEADERS)
+            for e in d.entries:
+                pub = e.get("published_parsed") or e.get("updated_parsed")
+                if not pub:
                     continue
-                pub_dt = datetime(*published[:6], tzinfo=timezone.utc)
+                pub_dt = datetime(*pub[:6], tzinfo=timezone.utc)
                 if pub_dt < cutoff:
                     continue
-                all_items.append({
-                    "source": source_name,
-                    "title": entry.get("title", "(Không có tiêu đề)"),
-                    "link": entry.get("link", ""),
-                    "summary": entry.get("summary", "")[:250],
-                    "published": pub_dt,
+                items.append({
+                    "source": source,
+                    "title": e.get("title", ""),
+                    "link": e.get("link", ""),
+                    "summary": e.get("summary", "")[:200],
                 })
-        except Exception as e:
-            print(f"[LỖI] {source_name}: {e}")
-
-    all_items.sort(key=lambda x: x["published"], reverse=True)
-    return all_items
+        except Exception as ex:
+            print(f"RSS error {source}: {ex}")
+    return items
 
 
-def summarize_with_ai(news_items):
-    if not news_items:
-        return "<p>Không có tin mới nào trong 24 giờ qua.</p>"
+async def summarize(items):
+    if not items:
+        return "<p>Không có tin mới trong 24 giờ qua.</p>", 0
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-    items_text = "\n\n".join(
-        f"[{item['source']}] {item['title']}\nLink: {item['link']}\nTóm tắt gốc: {item['summary'][:200]}"
-        for item in news_items[:35]
+    text = "\n\n".join(
+        f"[{it['source']}] {it['title']}\nLink: {it['link']}\n{it['summary']}"
+        for it in items[:30]
     )
 
-    system_prompt = """Bạn là trợ lý biên tập tin tài chính cho một chuyên viên đầu tư tại SCIC (Tổng Công ty Đầu tư và Kinh doanh vốn Nhà nước).
-Nhiệm vụ: đọc danh sách tin tức thô bên dưới, sau đó tạo bản tổng hợp tin tài chính Việt Nam trong ngày dưới dạng HTML.
-
+    system = """Bạn là trợ lý biên tập tin tài chính cho chuyên viên đầu tư SCIC.
+Tạo bản tổng hợp tin tài chính VN dạng HTML từ danh sách tin dưới đây.
 Yêu cầu:
-1. Phân loại tin theo các nhóm: "Thị trường chứng khoán", "Ngân hàng - Tài chính", "Doanh nghiệp - Cổ phần hóa", "Kinh tế vĩ mô", "Khác"
-2. Mỗi tin chỉ giữ lại nếu thực sự liên quan tài chính/kinh tế/doanh nghiệp
-3. Viết lại tiêu đề + 1-2 câu tóm tắt ngắn gọn bằng tiếng Việt, diễn đạt lại bằng lời riêng
-4. Mỗi tin có link để bấm đọc full bài (dùng <a href="..." target="_blank">)
-5. Đầu bản tin có một đoạn "Điểm nhấn hôm nay" (3-5 ý quan trọng nhất, bullet point)
-6. Output là HTML hoàn chỉnh (dùng <h2>, <h3>, <ul>, <li>, <a>), không cần <html>/<body> tag, không markdown code fence
-7. Văn phong chuyên nghiệp, súc tích"""
+1. Phân loại: "Thị trường chứng khoán", "Ngân hàng - Tài chính", "Doanh nghiệp", "Kinh tế vĩ mô"
+2. Mỗi tin: tiêu đề + 1-2 câu tóm tắt + link đọc thêm (<a href="..." target="_blank">)
+3. Đầu bản tin: "Điểm nhấn hôm nay" (3-5 ý bullet)
+4. Output: HTML thuần (dùng h2, h3, ul, li, a), không markdown, không code fence"""
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Danh sách tin hôm nay:\n\n{items_text}"},
-        ],
-        temperature=0.3,
-    )
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": f"Tin hôm nay:\n\n{text}"},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 2000,
+            },
+        )
+        resp.raise_for_status()
+        html = resp.json()["choices"][0]["message"]["content"].strip()
+        if html.startswith("```"):
+            html = html.strip("`").lstrip("html").strip()
+        return html, len(items)
 
-    html_content = response.choices[0].message.content.strip()
-    if html_content.startswith("```"):
-        html_content = html_content.strip("`").lstrip("html").strip()
-    return html_content, len(news_items)
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
 
 
-@app.route("/api/digest", methods=["GET"])
-def get_digest():
+@app.get("/api/digest")
+async def digest():
+    import time
     now = time.time()
-    # Nếu cache còn mới (dưới 15 phút) thì trả luôn, không gọi lại OpenAI
-    if _cache["data"] is not None and (now - _cache["timestamp"]) < CACHE_TTL_SECONDS:
-        return jsonify(_cache["data"])
+    if _cache["data"] and (now - _cache["timestamp"]) < CACHE_TTL:
+        return {**_cache["data"], "from_cache": True}
 
-    try:
-        news = fetch_recent_news()
-        html_content, total = summarize_with_ai(news)
-        result = {
-            "html": html_content,
-            "total_news": total,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "from_cache": False,
-        }
-        _cache["data"] = {**result, "from_cache": True}
-        _cache["timestamp"] = now
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    items = fetch_news()
+    html, total = await summarize(items)
+    result = {
+        "html": html,
+        "total_news": total,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "from_cache": False,
+    }
+    _cache["data"] = result
+    _cache["timestamp"] = now
+    return result
 
-
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+   
